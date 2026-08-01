@@ -2,7 +2,7 @@
 
 `cube.c` is a small 2D physics sandbox written in C using Raylib, GLFW, and Wayland. 
 
-This project isn't built for blazing-fast speed or optimization—it's just a fun personal hobby project exploring physics and rendering from scratch, so performance might be a bit rough around the edges! And yes, this is vibecoded, I am not an expert in C, so do not throw tomatoes at me.
+This project isn't built for blazing-fast speed or optimization—it's just a fun personal hobby project exploring physics and rendering from scratch, so performance might be a bit rough around the edges! And yes, this is a bit vibecoded, I am not an expert in C, so do not throw tomatoes at me.
 
 ---
 
