@@ -21,7 +21,45 @@ This project isn't built for blazing-fast speed or optimization—it's just a fu
 
 ## How to Compile
 
-Compile the program using the following command:
+First off, you need to install dependencies.
+
+Arch:
+```bash
+sudo pacman -S raylib glfw vulkan-tools openmp
+```
+
+Debian (or Ubuntu):
+```bash
+sudo apt install libraylib-dev libglfw3-dev vulkan-tools libomp-dev libomp-dev
+```
+
+Fedora:
+```bash
+sudo dnf install raylib-devel glfw-devel vulkan-tools libgomp
+```
+
+### Using CMake
 
 ```bash
-gcc cube.c -o cube -lraylib -lglfw -lvulkan -lm -lpthread -ldl -lwayland-client
+mkdir build && cd build
+cmake ..
+make
+```
+
+This creates a build directory, you configure it and make it.
+
+### Or if you don't want to use CMake:
+
+```bash
+gcc -fopenmp -O3 cube.c -o cube -lraylib -lglfw -lvulkan -lm -lpthread -ldl -march=native
+```
+
+This is GNU
+
+---
+
+## Notes
+
+- It's not optimized, so with OpenMP your CPU will probably go 90%
+- X11 is **not** supported, but soon will be supported.
+- I don't really know what to put here.

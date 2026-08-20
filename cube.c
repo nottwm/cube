@@ -20,7 +20,148 @@
 #include <omp.h>
 #endif
 
+/*
+ * SIMD dispatch is decided at COMPILE time from whatever -march the build
+ * uses, not guessed at runtime:
+ *   - Built with -march=haswell/skylake/native (Kaby Lake and newer, or any
+ *     "-march=native" build on such a machine) -> the compiler predefines
+ *     __AVX2__ -> we take the 8-floats-at-a-time AVX2 path.
+ *   - Any other x86-64 build (default gcc/clang target, older CPU) always
+ *     has at least SSE2 (it's part of the baseline x86-64 ABI) -> 4-wide
+ *     SSE2 path.
+ *   - Non-x86 (ARM etc.) -> plain scalar C, no intrinsics at all.
+ */
+#if defined(__AVX2__)
+    #include <immintrin.h>
+    #define CUBE_SIMD_AVX2 1
+#elif defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
+    #include <emmintrin.h>
+    #define CUBE_SIMD_SSE2 1
+#endif
+
+/* Below this many active cubes, thread wake/sync overhead costs more than
+ * the parallel work saves - so small cube counts (like 50) run these loops
+ * on the main thread instead of spiking every core just to check a handful
+ * of "is this active" flags. */
+#define OMP_PARALLEL_THRESHOLD 128
+
 #include "GLFW/glfw3.h"
+
+/*
+ * ==============================================================================
+ * DEBUG OVERLAY PLATFORM HOOKS (process CPU%, logical core count, GPU name)
+ * ==============================================================================
+ * Honesty note for future maintainers: there is no portable, dependency-free
+ * way to read a numeric "GPU usage %" (the kind nvidia-smi/Task Manager show)
+ * from inside the app itself - that needs a vendor SDK (NVML for NVIDIA,
+ * ADLX for AMD, etc.), which this file intentionally does not link against.
+ * What IS available everywhere: which GPU/driver is actually being used
+ * (glGetString is a stable OpenGL 1.1 entry point every desktop GL library
+ * exports statically, so this doesn't need any extra headers or linking
+ * beyond what raylib's own OpenGL backend already pulls in) and how much
+ * CPU time this process is burning (via the OS, platform-gated below).
+ */
+#if defined(_WIN32)
+    #include <windows.h>
+#else
+    #include <sys/resource.h>
+    #include <unistd.h>
+#endif
+
+#ifndef GL_VENDOR
+    #define GL_VENDOR   0x1F00
+    #define GL_RENDERER 0x1F01
+#endif
+// Deliberately NOT declared as `extern ... glGetString(...)` - that assumes
+// it's statically linked into the executable (true on some platforms/build
+// setups, false on others depending on how raylib was linked), which is
+// exactly the kind of "works on my machine" bug we don't want here. Instead
+// we fetch it through GLFW's own loader, which is guaranteed to resolve any
+// GL entry point - including old GL 1.1 ones like glGetString - once a
+// context is current, the same mechanism glad/GLEW use under the hood.
+typedef const unsigned char *(*PFNGLGETSTRINGPROC)(unsigned int name);
+
+static int GetLogicalCoreCount(void) {
+#if defined(_WIN32)
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    return (si.dwNumberOfProcessors > 0) ? (int)si.dwNumberOfProcessors : 1;
+#else
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    return (n > 0) ? (int)n : 1;
+#endif
+}
+
+// Process CPU usage, normalized to 0-100% across all logical cores (i.e.
+// "half the machine" reads 50%, matching Task Manager's per-process view
+// rather than top's default of summing to 100%-per-core). Refreshed at most
+// twice a second from raylib's own GetTime() clock so the number is stable
+// and readable instead of jittering every frame; cheap OS call either way.
+static float GetProcessCPUPercent(void) {
+    static double lastWallTime = -1.0;
+    static double lastCPUTime = 0.0;
+    static float cachedPercent = 0.0f;
+    static int coreCount = 0;
+    if (coreCount == 0) coreCount = GetLogicalCoreCount();
+
+    double wallNow = GetTime();
+    double cpuNow;
+
+#if defined(_WIN32)
+    FILETIME creation, exitTime, kernelTime, userTime;
+    if (!GetProcessTimes(GetCurrentProcess(), &creation, &exitTime, &kernelTime, &userTime)) {
+        return cachedPercent;
+    }
+    ULARGE_INTEGER k, u;
+    k.LowPart = kernelTime.dwLowDateTime; k.HighPart = kernelTime.dwHighDateTime;
+    u.LowPart = userTime.dwLowDateTime;   u.HighPart = userTime.dwHighDateTime;
+    cpuNow = (double)(k.QuadPart + u.QuadPart) / 1e7; // 100ns units -> seconds
+#else
+    struct rusage usage;
+    if (getrusage(RUSAGE_SELF, &usage) != 0) {
+        return cachedPercent;
+    }
+    cpuNow = (usage.ru_utime.tv_sec + usage.ru_utime.tv_usec / 1e6) +
+             (usage.ru_stime.tv_sec + usage.ru_stime.tv_usec / 1e6);
+#endif
+
+    if (lastWallTime < 0.0) {
+        lastWallTime = wallNow;
+        lastCPUTime = cpuNow;
+        return cachedPercent;
+    }
+
+    double wallDelta = wallNow - lastWallTime;
+    if (wallDelta >= 0.5) {
+        double cpuDelta = cpuNow - lastCPUTime;
+        float pct = (float)((cpuDelta / wallDelta) * 100.0 / (double)coreCount);
+        cachedPercent = Clamp(pct, 0.0f, 100.0f);
+        lastWallTime = wallNow;
+        lastCPUTime = cpuNow;
+    }
+
+    return cachedPercent;
+}
+
+// glGetString only works once a GL context is current, so call this AFTER
+// InitWindow(). Resolved once via glfwGetProcAddress (works regardless of
+// whether the platform's GL is statically linked) and cached in a static
+// buffer - not re-fetched per frame.
+static const char *GetGPURendererName(void) {
+    static char cached[256] = { 0 };
+    static bool fetched = false;
+    if (!fetched) {
+        fetched = true;
+        PFNGLGETSTRINGPROC glGetStringPtr = (PFNGLGETSTRINGPROC)glfwGetProcAddress("glGetString");
+        const unsigned char *renderer = glGetStringPtr ? glGetStringPtr(GL_RENDERER) : NULL;
+        if (renderer) {
+            strncpy(cached, (const char *)renderer, sizeof(cached) - 1);
+        } else {
+            strncpy(cached, "Unknown", sizeof(cached) - 1);
+        }
+    }
+    return cached;
+}
 
 #define APP_VERSION "6.16.0"
 #define MAX_CUBES 1000
@@ -43,6 +184,20 @@
 #define BASE_DRAG_STIFFNESS 300.0f  
 #define BASE_DRAG_DAMPING 20.0f     
 
+/* --- Spawn animation / spawn toss --- */
+#define SPAWN_ANIM_DURATION 0.28f
+#define SPAWN_TOSS_VX_MIN (-160.0f)
+#define SPAWN_TOSS_VX_MAX (160.0f)
+#define SPAWN_TOSS_VY_MIN (-260.0f)
+#define SPAWN_TOSS_VY_MAX (-40.0f)
+#define SPAWN_TOSS_ANGVEL_MAX 6.0f
+
+/* --- Particles (GPU-batched via raylib's immediate-mode draw batching, no CPU rasterization) --- */
+#define MAX_PARTICLES 4096
+#define PARTICLE_GRAVITY 900.0f
+#define PARTICLE_DRAG 0.985f
+#define IMPACT_SPEED_THRESHOLD 180.0f
+
 typedef struct {
     Vector2 position;
     Vector2 velocity;
@@ -53,7 +208,18 @@ typedef struct {
     Color baseColor;       
     bool active;
     bool isGrounded;       
+    float spawnTimer;      // Counts up from 0 on spawn; drives the pop-in scale animation
 } RigidCube;
+
+typedef struct {
+    Vector2 position;
+    Vector2 velocity;
+    float life;
+    float maxLife;
+    float size;
+    Color color;
+    bool active;
+} Particle;
 
 typedef struct SpatialNode {
     int cubeIndex;
@@ -70,6 +236,7 @@ static unsigned int g_tokenCounter = 1;
 static bool g_debugMode = false;
 static bool g_advancedDebugMode = false;
 static bool g_enableCubeCollisions = true;
+static bool g_showDebugOverlay = false; // F3
 
 static char g_lastLogBuffer[512] = {0};
 static int g_repeatCount = 0;
@@ -112,6 +279,82 @@ Color GetRandomDynamicColor(void) {
     };
 }
 
+float RandRangeF(float lo, float hi) {
+    return lo + (float)GetRandomValue(0, 10000) / 10000.0f * (hi - lo);
+}
+
+/*
+ * ==============================================================================
+ * PARTICLE SYSTEM (GPU-batched)
+ * ==============================================================================
+ * A flat, fixed-size pool with a ring-buffer cursor - no allocation, no per-frame
+ * CPU rasterization. Every particle is just a DrawCircleV call, which raylib
+ * batches into a handful of hardware draw calls via its internal vertex buffer,
+ * same as the cube glow sprites. Update is O(MAX_PARTICLES) and OpenMP-parallel.
+ */
+static Particle g_particles[MAX_PARTICLES];
+static int g_particleCursor = 0;
+
+void SpawnParticleBurst(Vector2 origin, Color color, int count, float minSpeed, float maxSpeed, float minLife, float maxLife, float minSize, float maxSize) {
+    for (int n = 0; n < count; n++) {
+        Particle *p = &g_particles[g_particleCursor];
+        g_particleCursor = (g_particleCursor + 1) % MAX_PARTICLES;
+
+        float angle = RandRangeF(0.0f, 2.0f * PI);
+        float speed = RandRangeF(minSpeed, maxSpeed);
+
+        p->position = origin;
+        p->velocity = (Vector2){ cosf(angle) * speed, sinf(angle) * speed };
+        p->maxLife = RandRangeF(minLife, maxLife);
+        p->life = p->maxLife;
+        p->size = RandRangeF(minSize, maxSize);
+        p->color = color;
+        p->active = true;
+    }
+}
+
+void UpdateParticles(float dt) {
+    #pragma omp parallel for schedule(static, 128)
+    for (int i = 0; i < MAX_PARTICLES; i++) {
+        Particle *p = &g_particles[i];
+        if (!p->active) continue;
+
+        p->life -= dt;
+        if (p->life <= 0.0f) {
+            p->active = false;
+            continue;
+        }
+
+        p->velocity.y += PARTICLE_GRAVITY * dt;
+        p->velocity = Vector2Scale(p->velocity, PARTICLE_DRAG);
+        p->position = Vector2Add(p->position, Vector2Scale(p->velocity, dt));
+    }
+}
+
+void DrawParticles(void) {
+    BeginBlendMode(BLEND_ADDITIVE);
+    for (int i = 0; i < MAX_PARTICLES; i++) {
+        Particle *p = &g_particles[i];
+        if (!p->active) continue;
+
+        float t = p->life / p->maxLife;
+        Color c = Fade(p->color, t);
+        DrawCircleV(p->position, p->size * t, c);
+    }
+    EndBlendMode();
+}
+
+// Only called while the F3 debug overlay is open (see main loop) - a plain
+// O(MAX_PARTICLES) scan is fine for a once-a-frame debug readout, but there's
+// no reason to pay it when the overlay is hidden.
+int CountActiveParticles(void) {
+    int count = 0;
+    for (int i = 0; i < MAX_PARTICLES; i++) {
+        if (g_particles[i].active) count++;
+    }
+    return count;
+}
+
 float GetMomentOfInertia(float mass, float size) {
     return (1.0f / 6.0f) * mass * (size * size);
 }
@@ -143,6 +386,38 @@ bool IsPointInCube(Vector2 p, Vector2 corners[4]) {
         }
     }
     return inside;
+}
+
+/*
+ * Same point-in-quad test, but against a slightly outward-inflated copy of the
+ * quad. Used only for contact-manifold generation on flush resting contacts:
+ * without this, whether a corner counts as "touching" flickers between frames
+ * due to plain floating-point noise, so a stacked cube can randomly get a
+ * single off-center contact point one frame and two the next. A single
+ * contact applies torque a two-point contact wouldn't, and that phantom
+ * torque is what reads as an idle stacked cube "sliding for no reason."
+ * Inflating the test quad by a hair makes both corners of a flush edge
+ * register reliably, every frame, so the contact count stops flickering.
+ */
+bool IsPointInCubeMargin(Vector2 p, Vector2 corners[4], float margin) {
+    Vector2 centroid = { 0, 0 };
+    for (int i = 0; i < 4; i++) {
+        centroid.x += corners[i].x;
+        centroid.y += corners[i].y;
+    }
+    centroid.x *= 0.25f;
+    centroid.y *= 0.25f;
+
+    Vector2 inflated[4];
+    for (int i = 0; i < 4; i++) {
+        Vector2 dir = Vector2Subtract(corners[i], centroid);
+        float len = Vector2Length(dir);
+        if (len > 0.0001f) {
+            dir = Vector2Scale(dir, (len + margin) / len);
+        }
+        inflated[i] = Vector2Add(centroid, dir);
+    }
+    return IsPointInCube(p, inflated);
 }
 
 float Cross2DVec(Vector2 a, Vector2 b) {
@@ -248,11 +523,12 @@ void ResolveCubeToCubeCollision(int idxA, int idxB, RigidCube *a, RigidCube *b, 
     Vector2 contacts[4];
     int contactCount = 0;
 
+    #define CONTACT_MARGIN 1.0f
     for (int i = 0; i < 4; i++) {
-        if (IsPointInCube(cornersA[i], cornersB)) contacts[contactCount++] = cornersA[i];
+        if (IsPointInCubeMargin(cornersA[i], cornersB, CONTACT_MARGIN)) contacts[contactCount++] = cornersA[i];
     }
     for (int i = 0; i < 4; i++) {
-        if (IsPointInCube(cornersB[i], cornersA) && contactCount < 4) contacts[contactCount++] = cornersB[i];
+        if (IsPointInCubeMargin(cornersB[i], cornersA, CONTACT_MARGIN) && contactCount < 4) contacts[contactCount++] = cornersB[i];
     }
 
     if (contactCount == 0) {
@@ -292,6 +568,17 @@ void ResolveCubeToCubeCollision(int idxA, int idxB, RigidCube *a, RigidCube *b, 
 
         b->velocity = Vector2Add(b->velocity, Vector2Scale(normalImpulse, invMass));
         b->angularVelocity += Cross2DVec(rB, normalImpulse) * invInertia;
+
+        if (applyPositionCorrection && vn > IMPACT_SPEED_THRESHOLD) {
+            float impactRatio = Clamp(vn / 900.0f, 0.0f, 1.0f);
+            Color sparkColor = {
+                (unsigned char)((a->baseColor.r + b->baseColor.r) / 2),
+                (unsigned char)((a->baseColor.g + b->baseColor.g) / 2),
+                (unsigned char)((a->baseColor.b + b->baseColor.b) / 2),
+                255
+            };
+            SpawnParticleBurst(pt, sparkColor, (int)(2 + impactRatio * 6), 20.0f, 60.0f + impactRatio * 220.0f, 0.15f, 0.4f, 1.5f, 3.5f);
+        }
 
         Vector2 tangent = { -normal.y, normal.x };
         Vector2 newRelVel = Vector2Subtract(
@@ -377,6 +664,11 @@ void ResolveWallCollision(RigidCube *k, float minX, float maxX, float minY, floa
                     k->isGrounded = true;
                 }
 
+                if (applyPositionCorrection && (-vn) > IMPACT_SPEED_THRESHOLD) {
+                    float impactRatio = Clamp((-vn) / 900.0f, 0.0f, 1.0f);
+                    SpawnParticleBurst(pt, k->baseColor, (int)(2 + impactRatio * 5), 15.0f, 50.0f + impactRatio * 180.0f, 0.12f, 0.35f, 1.5f, 3.0f);
+                }
+
                 Vector2 tangent = { -normal.y, normal.x };
                 Vector2 updatedContactVel = Vector2Add(k->velocity, Cross2DScalar(k->angularVelocity, r));
                 float vt = Vector2DotProduct(updatedContactVel, tangent);
@@ -406,6 +698,229 @@ void ResolveWallCollision(RigidCube *k, float minX, float maxX, float minY, floa
     }
 }
 
+/*
+ * ==============================================================================
+ * BULK CUBE INTEGRATION (gravity, position/rotation, air drag, ground damping)
+ * ==============================================================================
+ * This is the one loop in the engine that's a genuinely good SIMD target:
+ * fixed amount of straight-line float math per cube, same operations for
+ * every cube, no early-outs. (Collision resolution isn't - it's full of
+ * per-pair early returns and variable contact counts, so it stays scalar;
+ * vectorizing branchy code like that usually makes it slower, not faster.)
+ *
+ * Cube fields live interleaved in RigidCube (AoS), so we pack the handful of
+ * floats this loop needs into flat arrays (SoA), run the vector math, then
+ * scatter the results back. Those scratch arrays are static (.bss) - sized
+ * once at compile time, zero malloc/free per frame, so there's no allocator
+ * overhead riding along with the "optimization".
+ */
+static float g_ix[MAX_CUBES], g_iy[MAX_CUBES];
+static float g_ivx[MAX_CUBES], g_ivy[MAX_CUBES];
+static float g_irot[MAX_CUBES], g_iang[MAX_CUBES];
+static float g_ispawn[MAX_CUBES], g_iGroundMask[MAX_CUBES];
+
+// Plain scalar version - identical math to the original loop. Used as the
+// fallback for non-x86 builds, and to mop up the "count % SIMD width" tail.
+static void IntegrateCubesScalarRange(RigidCube *cubes, int start, int end, float dt, float gravity) {
+    for (int k = start; k < end; k++) {
+        RigidCube *c = &cubes[k];
+
+        if (c->spawnTimer < SPAWN_ANIM_DURATION) {
+            c->spawnTimer += dt;
+        }
+
+        c->velocity.y += gravity * dt;
+        c->position.x += c->velocity.x * dt;
+        c->position.y += c->velocity.y * dt;
+        c->rotation += c->angularVelocity * dt;
+
+        float angularSign = (c->angularVelocity > 0.0f) ? 1.0f : -1.0f;
+        float airTorque = AIR_RESISTANCE * (c->angularVelocity * c->angularVelocity) * angularSign;
+        c->angularVelocity -= airTorque * dt;
+        c->angularVelocity *= 0.999f;
+
+        if (!c->isDragged && c->isGrounded) {
+            if (Vector2LengthSqr(c->velocity) < 12.0f) {
+                c->velocity.y = 0.0f;
+                c->velocity.x *= 0.85f;
+            }
+            if (fabsf(c->angularVelocity) < 0.02f) {
+                c->angularVelocity = 0.0f;
+            }
+        }
+
+        c->isGrounded = false;
+    }
+}
+
+#if defined(CUBE_SIMD_AVX2) || defined(CUBE_SIMD_SSE2)
+static void IntegrateCubesSIMD(RigidCube *cubes, int count, float dt, float gravity) {
+#if defined(CUBE_SIMD_AVX2)
+    const int W = 8;
+#else
+    const int W = 4;
+#endif
+    int vecCount = (count / W) * W;
+
+    for (int k = 0; k < vecCount; k++) {
+        g_ix[k]  = cubes[k].position.x;
+        g_iy[k]  = cubes[k].position.y;
+        g_ivx[k] = cubes[k].velocity.x;
+        g_ivy[k] = cubes[k].velocity.y;
+        g_irot[k]  = cubes[k].rotation;
+        g_iang[k]  = cubes[k].angularVelocity;
+        g_ispawn[k] = cubes[k].spawnTimer;
+        g_iGroundMask[k] = (!cubes[k].isDragged && cubes[k].isGrounded) ? 1.0f : 0.0f;
+    }
+
+    for (int k = 0; k < vecCount; k += W) {
+#if defined(CUBE_SIMD_AVX2)
+        __m256 vx = _mm256_loadu_ps(&g_ivx[k]);
+        __m256 vy = _mm256_loadu_ps(&g_ivy[k]);
+        __m256 px = _mm256_loadu_ps(&g_ix[k]);
+        __m256 py = _mm256_loadu_ps(&g_iy[k]);
+        __m256 rot = _mm256_loadu_ps(&g_irot[k]);
+        __m256 ang = _mm256_loadu_ps(&g_iang[k]);
+        __m256 spawn = _mm256_loadu_ps(&g_ispawn[k]);
+        // Loaded as 1.0f/0.0f, not a bitmask - turn it into a proper
+        // all-ones/all-zeros compare mask before using it with and/andnot.
+        __m256 groundMask = _mm256_cmp_ps(_mm256_loadu_ps(&g_iGroundMask[k]), _mm256_set1_ps(0.5f), _CMP_GT_OQ);
+
+        __m256 dtv = _mm256_set1_ps(dt);
+        __m256 zero = _mm256_setzero_ps();
+
+        __m256 spawnLT = _mm256_cmp_ps(spawn, _mm256_set1_ps(SPAWN_ANIM_DURATION), _CMP_LT_OQ);
+        spawn = _mm256_blendv_ps(spawn, _mm256_add_ps(spawn, dtv), spawnLT);
+
+        vy = _mm256_add_ps(vy, _mm256_mul_ps(_mm256_set1_ps(gravity), dtv));
+        px = _mm256_add_ps(px, _mm256_mul_ps(vx, dtv));
+        py = _mm256_add_ps(py, _mm256_mul_ps(vy, dtv));
+        rot = _mm256_add_ps(rot, _mm256_mul_ps(ang, dtv));
+
+        __m256 signMask = _mm256_cmp_ps(ang, zero, _CMP_GT_OQ);
+        __m256 sign = _mm256_blendv_ps(_mm256_set1_ps(-1.0f), _mm256_set1_ps(1.0f), signMask);
+        __m256 airTorque = _mm256_mul_ps(_mm256_mul_ps(_mm256_set1_ps(AIR_RESISTANCE), _mm256_mul_ps(ang, ang)), sign);
+        ang = _mm256_sub_ps(ang, _mm256_mul_ps(airTorque, dtv));
+        ang = _mm256_mul_ps(ang, _mm256_set1_ps(0.999f));
+
+        __m256 speedSq = _mm256_add_ps(_mm256_mul_ps(vx, vx), _mm256_mul_ps(vy, vy));
+        __m256 slowEnough = _mm256_cmp_ps(speedSq, _mm256_set1_ps(12.0f), _CMP_LT_OQ);
+        __m256 applyLinDamp = _mm256_and_ps(groundMask, slowEnough);
+        vy = _mm256_blendv_ps(vy, zero, applyLinDamp);
+        vx = _mm256_blendv_ps(vx, _mm256_mul_ps(vx, _mm256_set1_ps(0.85f)), applyLinDamp);
+
+        __m256 absAng = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), ang);
+        __m256 applyAngDamp = _mm256_and_ps(groundMask, _mm256_cmp_ps(absAng, _mm256_set1_ps(0.02f), _CMP_LT_OQ));
+        ang = _mm256_blendv_ps(ang, zero, applyAngDamp);
+
+        _mm256_storeu_ps(&g_ix[k], px);
+        _mm256_storeu_ps(&g_iy[k], py);
+        _mm256_storeu_ps(&g_ivx[k], vx);
+        _mm256_storeu_ps(&g_ivy[k], vy);
+        _mm256_storeu_ps(&g_irot[k], rot);
+        _mm256_storeu_ps(&g_iang[k], ang);
+        _mm256_storeu_ps(&g_ispawn[k], spawn);
+#else
+        __m128 vx = _mm_loadu_ps(&g_ivx[k]);
+        __m128 vy = _mm_loadu_ps(&g_ivy[k]);
+        __m128 px = _mm_loadu_ps(&g_ix[k]);
+        __m128 py = _mm_loadu_ps(&g_iy[k]);
+        __m128 rot = _mm_loadu_ps(&g_irot[k]);
+        __m128 ang = _mm_loadu_ps(&g_iang[k]);
+        __m128 spawn = _mm_loadu_ps(&g_ispawn[k]);
+        // Loaded as 1.0f/0.0f, not a bitmask - turn it into a proper
+        // all-ones/all-zeros compare mask before using it with and/andnot.
+        __m128 groundMask = _mm_cmpgt_ps(_mm_loadu_ps(&g_iGroundMask[k]), _mm_set1_ps(0.5f));
+
+        __m128 dtv = _mm_set1_ps(dt);
+        __m128 zero = _mm_setzero_ps();
+
+        __m128 spawnLT = _mm_cmplt_ps(spawn, _mm_set1_ps(SPAWN_ANIM_DURATION));
+        spawn = _mm_or_ps(_mm_and_ps(spawnLT, _mm_add_ps(spawn, dtv)), _mm_andnot_ps(spawnLT, spawn));
+
+        vy = _mm_add_ps(vy, _mm_mul_ps(_mm_set1_ps(gravity), dtv));
+        px = _mm_add_ps(px, _mm_mul_ps(vx, dtv));
+        py = _mm_add_ps(py, _mm_mul_ps(vy, dtv));
+        rot = _mm_add_ps(rot, _mm_mul_ps(ang, dtv));
+
+        __m128 signMask = _mm_cmpgt_ps(ang, zero);
+        __m128 sign = _mm_or_ps(_mm_and_ps(signMask, _mm_set1_ps(1.0f)), _mm_andnot_ps(signMask, _mm_set1_ps(-1.0f)));
+        __m128 airTorque = _mm_mul_ps(_mm_mul_ps(_mm_set1_ps(AIR_RESISTANCE), _mm_mul_ps(ang, ang)), sign);
+        ang = _mm_sub_ps(ang, _mm_mul_ps(airTorque, dtv));
+        ang = _mm_mul_ps(ang, _mm_set1_ps(0.999f));
+
+        __m128 speedSq = _mm_add_ps(_mm_mul_ps(vx, vx), _mm_mul_ps(vy, vy));
+        __m128 slowEnough = _mm_cmplt_ps(speedSq, _mm_set1_ps(12.0f));
+        __m128 applyLinDamp = _mm_and_ps(groundMask, slowEnough);
+        vy = _mm_or_ps(_mm_and_ps(applyLinDamp, zero), _mm_andnot_ps(applyLinDamp, vy));
+        __m128 vxScaled = _mm_mul_ps(vx, _mm_set1_ps(0.85f));
+        vx = _mm_or_ps(_mm_and_ps(applyLinDamp, vxScaled), _mm_andnot_ps(applyLinDamp, vx));
+
+        __m128 absMask = _mm_castsi128_ps(_mm_set1_epi32(0x7FFFFFFF));
+        __m128 absAng = _mm_and_ps(ang, absMask);
+        __m128 applyAngDamp = _mm_and_ps(groundMask, _mm_cmplt_ps(absAng, _mm_set1_ps(0.02f)));
+        ang = _mm_or_ps(_mm_and_ps(applyAngDamp, zero), _mm_andnot_ps(applyAngDamp, ang));
+
+        _mm_storeu_ps(&g_ix[k], px);
+        _mm_storeu_ps(&g_iy[k], py);
+        _mm_storeu_ps(&g_ivx[k], vx);
+        _mm_storeu_ps(&g_ivy[k], vy);
+        _mm_storeu_ps(&g_irot[k], rot);
+        _mm_storeu_ps(&g_iang[k], ang);
+        _mm_storeu_ps(&g_ispawn[k], spawn);
+#endif
+    }
+
+    for (int k = 0; k < vecCount; k++) {
+        cubes[k].position.x = g_ix[k];
+        cubes[k].position.y = g_iy[k];
+        cubes[k].velocity.x = g_ivx[k];
+        cubes[k].velocity.y = g_ivy[k];
+        cubes[k].rotation = g_irot[k];
+        cubes[k].angularVelocity = g_iang[k];
+        cubes[k].spawnTimer = g_ispawn[k];
+        cubes[k].isGrounded = false;
+    }
+
+    // Remainder that didn't fill a full vector (count % W cubes)
+    IntegrateCubesScalarRange(cubes, vecCount, count, dt, gravity);
+}
+#endif
+
+// Single entry point the main loop calls - picks SIMD vs scalar once here,
+// so nothing else in the file needs to know or care which path is active.
+static void IntegrateCubes(RigidCube *cubes, int count, float dt, float gravity) {
+#if defined(CUBE_SIMD_AVX2) || defined(CUBE_SIMD_SSE2)
+    // Packing/unpacking into SoA scratch has fixed overhead per call; below
+    // one vector's worth there's nothing to amortize it with, so just do it
+    // scalar rather than pay pack/unpack cost to vectorize 1-3 cubes.
+    if (count >= 32) {
+        IntegrateCubesSIMD(cubes, count, dt, gravity);
+        return;
+    }
+#endif
+    IntegrateCubesScalarRange(cubes, 0, count, dt, gravity);
+}
+
+/*
+ * ==============================================================================
+ * SCENE BACKGROUND
+ * ==============================================================================
+ * Cheap GPU-only draw calls (gradient fill + grid lines), no textures to
+ * regenerate, no per-pixel CPU work - raylib batches these into a couple of
+ * hardware draw calls per frame, same as the shapes.c grid backdrop.
+ */
+void DrawSceneBackground(int screenWidth, int screenHeight) {
+    Color topColor = (Color){ 5, 10, 15, 255 };
+    Color bottomColor = (Color){ 0, 30, 50, 255 };
+    DrawRectangleGradientV(0, 0, screenWidth, screenHeight, topColor, bottomColor);
+
+    Color gridColor = (Color){ 255, 255, 255, 10 };
+    int gridSpacing = 48;
+    for (int x = 0; x < screenWidth; x += gridSpacing) DrawLine(x, 0, x, screenHeight, gridColor);
+    for (int y = 0; y < screenHeight; y += gridSpacing) DrawLine(0, y, screenWidth, y, gridColor);
+}
+
 void PrintHelp(void) {
     printf("Usage: cube.c [OPTIONS]\n\n");
     printf("cube.c - 2D Newtonian Rigid-Body Physics Engine (Hardware acceleration)\n\n");
@@ -414,6 +929,7 @@ void PrintHelp(void) {
     printf("  Right Click       : Trigger a radical shockwave explosion\n");
     printf("  N                 : Spawn a new cube at cursor\n");
     printf("  B                 : Toggle inter-cube collisions\n");
+    printf("  F3                : Toggle expanded debug overlay (top-right)\n");
     printf("  R                 : Reset scene\n");
     printf("  Spacebar          : Toggle gravity\n");
     printf("  F11               : Toggle borderless fullscreen\n");
@@ -423,6 +939,38 @@ void PrintHelp(void) {
     printf("  -D, --advanced-debug  Enable verbose logging (WARNING: May cause lag!)\n");
     printf("  -v, --version         Display application version\n");
     printf("  -h, --help            Display this help menu\n");
+}
+
+// -----------------------------------------------------------------------------
+// CAMERA AND SHAKE SYSTEM (ADDED FOR VISUAL EFFECTS)
+// -----------------------------------------------------------------------------
+static Camera2D g_camera = { 0 };
+static float g_shakeIntensity = 0.0f;
+static float g_shakeDuration = 0.0f;
+
+void TriggerScreenShake(float intensity, float duration) {
+    g_shakeIntensity = intensity;
+    g_shakeDuration = duration;
+}
+
+void UpdateCameraShake(float dt) {
+    if (g_shakeDuration > 0.0f) {
+        g_shakeDuration -= dt;
+        if (g_shakeDuration < 0.0f) g_shakeDuration = 0.0f;
+
+        // Calculate decayed intensity
+        float t = g_shakeDuration / 0.5f; // Normalized based on typical max duration (adjust as needed)
+        if (t > 1.0f) t = 1.0f;
+        float currentIntensity = g_shakeIntensity * t;
+
+        // Random jitter
+        g_camera.target.x = (GetRandomValue(-100, 100) / 100.0f) * currentIntensity;
+        g_camera.target.y = (GetRandomValue(-100, 100) / 100.0f) * currentIntensity;
+    } else {
+        g_camera.target.x = 0.0f;
+        g_camera.target.y = 0.0f;
+        g_shakeIntensity = 0.0f;
+    }
 }
 
 int main(int argc, char *argv[]) {
@@ -468,6 +1016,12 @@ int main(int argc, char *argv[]) {
 
     GLFWwindow *glfwWin = glfwGetCurrentContext();
 
+    // Initialize Camera2D
+    g_camera.zoom = 1.0f;
+    g_camera.offset = (Vector2){ 0, 0 };
+    g_camera.rotation = 0.0f;
+    g_camera.target = (Vector2){ 0, 0 };
+
     int glowTexSize = (int)(CUBE_SIZE + (GLOW_RADIUS * 2.0f));
     Image glowImg = GenImageColor(glowTexSize, glowTexSize, (Color){ 0, 0, 0, 0 });
     Vector2 glowCenter = { (float)glowTexSize / 2.0f, (float)glowTexSize / 2.0f };
@@ -499,7 +1053,8 @@ int main(int argc, char *argv[]) {
         .isDragged = false,
         .baseColor = initialColor,
         .active = true,
-        .isGrounded = false
+        .isGrounded = false,
+        .spawnTimer = SPAWN_ANIM_DURATION // Skip pop-in animation for the very first cube
     };
     LOG_DEBUG("SPAWNED INITIAL CUBE #0 with Color RGB(%d, %d, %d)", initialColor.r, initialColor.g, initialColor.b);
 
@@ -519,6 +1074,7 @@ int main(int argc, char *argv[]) {
     float quitHoldTimer = 0.0f;
     const float quitHoldRequired = 3.0f;
     unsigned long frameCounter = 0;
+    double lastFrameDrawMs = 0.0; // draw-submit time is only known AFTER EndDrawing, so the F3 overlay shows last frame's number (standard one-frame-delayed timing display)
 
     LOG_DEBUG("Initialized physics engine with hardware acceleration: Mass=%.1f, Inertia=%.2f", MASS, inertia);
 
@@ -526,6 +1082,9 @@ int main(int argc, char *argv[]) {
         frameCounter++;
         float frameDt = GetFrameTime();
         if (frameDt > 0.02f) frameDt = 0.02f;
+
+        // Update camera shake each frame
+        UpdateCameraShake(frameDt);
 
         float xScale = 1.0f, yScale = 1.0f;
         if (glfwWin) {
@@ -573,6 +1132,10 @@ int main(int argc, char *argv[]) {
             LOG_DEBUG("INTER-CUBE COLLISIONS %s", g_enableCubeCollisions ? "ENABLED" : "DISABLED");
         }
 
+        if (IsKeyPressed(KEY_F3)) {
+            g_showDebugOverlay = !g_showDebugOverlay;
+        }
+
         Vector2 mousePos = GetMousePosition();
 
         if (IsKeyPressed(KEY_N)) {
@@ -580,19 +1143,24 @@ int main(int argc, char *argv[]) {
                 for (int i = 0; i < MAX_CUBES; i++) {
                     if (!cubes[i].active) {
                         Color newColor = GetRandomDynamicColor();
+                        // Give every new cube a little random toss, just like shapes.c's SpawnRandomAtMouse
+                        Vector2 tossVel = { RandRangeF(SPAWN_TOSS_VX_MIN, SPAWN_TOSS_VX_MAX), RandRangeF(SPAWN_TOSS_VY_MIN, SPAWN_TOSS_VY_MAX) };
+                        float tossSpin = RandRangeF(-SPAWN_TOSS_ANGVEL_MAX, SPAWN_TOSS_ANGVEL_MAX);
                         cubes[i] = (RigidCube){
                             .position = mousePos,
-                            .velocity = { 0, 0 },
+                            .velocity = tossVel,
                             .rotation = 0.0f,
-                            .angularVelocity = 0.0f,
+                            .angularVelocity = tossSpin,
                             .isDragged = false,
                             .baseColor = newColor,
                             .active = true,
-                            .isGrounded = false
+                            .isGrounded = false,
+                            .spawnTimer = 0.0f
                         };
                         activeCubeCount++;
-                        LOG_DEBUG("SPAWNED CUBE #%d at [%.1f, %.1f] | Color RGB(%d, %d, %d)", 
-                                  i, mousePos.x, mousePos.y, newColor.r, newColor.g, newColor.b);
+                        SpawnParticleBurst(mousePos, newColor, 18, 40.0f, 220.0f, 0.25f, 0.55f, 1.5f, 4.0f);
+                        LOG_DEBUG("SPAWNED CUBE #%d at [%.1f, %.1f] | Color RGB(%d, %d, %d) | Toss [%.1f, %.1f]", 
+                                  i, mousePos.x, mousePos.y, newColor.r, newColor.g, newColor.b, tossVel.x, tossVel.y);
                         break;
                     }
                 }
@@ -615,10 +1183,13 @@ int main(int argc, char *argv[]) {
                 .isDragged = false,
                 .baseColor = resetColor,
                 .active = true,
-                .isGrounded = false
+                .isGrounded = false,
+                .spawnTimer = 0.0f
             };
             activeCubeCount = 1;
             draggedCubeIdx = -1;
+            memset(g_particles, 0, sizeof(g_particles));
+            SpawnParticleBurst(cubes[0].position, resetColor, 18, 40.0f, 220.0f, 0.25f, 0.55f, 1.5f, 4.0f);
             LOG_DEBUG("RESET SCENE TO SINGLE CUBE | Color RGB(%d, %d, %d)", resetColor.r, resetColor.g, resetColor.b);
         }
 
@@ -646,7 +1217,7 @@ int main(int argc, char *argv[]) {
         float maxY = screenHeight - BORDER_MARGIN;
 
         if (screenWidth != lastScreenWidth || screenHeight != lastScreenHeight) {
-            for (int k = 0; k < MAX_CUBES; k++) {
+            for (int k = 0; k < activeCubeCount; k++) {
                 if (!cubes[k].active) continue;
 
                 float rad = cubes[k].rotation;
@@ -673,7 +1244,10 @@ int main(int argc, char *argv[]) {
 
         if (IsMouseButtonPressed(MOUSE_BUTTON_RIGHT)) {
             LogAdvancedDedup("Frame #%lu | Radial Shockwave Triggered at Cursor [%.1f, %.1f]", frameCounter, mousePos.x, mousePos.y);
-            for (int k = 0; k < MAX_CUBES; k++) {
+            // Trigger screen shake on explosion!
+            TriggerScreenShake(12.0f, 0.5f); 
+            SpawnParticleBurst(mousePos, (Color){ 255, 210, 120, 255 }, 40, 120.0f, 520.0f, 0.3f, 0.7f, 2.0f, 4.5f);
+            for (int k = 0; k < activeCubeCount; k++) {
                 if (!cubes[k].active) continue;
 
                 Vector2 delta = Vector2Subtract(cubes[k].position, mousePos);
@@ -690,7 +1264,7 @@ int main(int argc, char *argv[]) {
         }
 
         if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
-            for (int k = MAX_CUBES - 1; k >= 0; k--) {
+            for (int k = activeCubeCount - 1; k >= 0; k--) {
                 if (!cubes[k].active) continue;
 
                 Vector2 corners[4];
@@ -723,6 +1297,7 @@ int main(int argc, char *argv[]) {
          * massive jump. This keeps stacking and collisions from tearing holes through reality.
          */
         float dt = frameDt / (float)PHYSICS_SUBSTEPS;
+        double physicsStepStart = GetTime();
 
         for (int sub = 0; sub < PHYSICS_SUBSTEPS; sub++) {
             
@@ -744,34 +1319,12 @@ int main(int argc, char *argv[]) {
                                  frameCounter, sub, draggedCubeIdx, c->position.x, c->position.y, c->velocity.x, c->velocity.y);
             }
 
-            // CPU Multi-Core Parallel Integration via OpenMP
-            #pragma omp parallel for schedule(static, 64)
-            for (int k = 0; k < MAX_CUBES; k++) {
-                if (!cubes[k].active) continue;
-
-                cubes[k].velocity.y += currentGravity * dt;
-                cubes[k].position.x += cubes[k].velocity.x * dt;
-                cubes[k].position.y += cubes[k].velocity.y * dt;
-
-                cubes[k].rotation += cubes[k].angularVelocity * dt;
-
-                float angularSign = (cubes[k].angularVelocity > 0.0f) ? 1.0f : -1.0f;
-                float airTorque = AIR_RESISTANCE * (cubes[k].angularVelocity * cubes[k].angularVelocity) * angularSign;
-                cubes[k].angularVelocity -= airTorque * dt;
-                cubes[k].angularVelocity *= 0.999f;
-
-                if (!cubes[k].isDragged && cubes[k].isGrounded) {
-                    if (Vector2LengthSqr(cubes[k].velocity) < 12.0f) {
-                        cubes[k].velocity.y = 0.0f;
-                        cubes[k].velocity.x *= 0.85f;
-                    }
-                    if (fabsf(cubes[k].angularVelocity) < 0.02f) {
-                        cubes[k].angularVelocity = 0.0f;
-                    }
-                }
-
-                cubes[k].isGrounded = false; 
-            }
+            // Bulk gravity/position/rotation/drag integration for every active
+            // cube (SIMD-accelerated, see IntegrateCubes above). Bounded to
+            // activeCubeCount instead of MAX_CUBES since active cubes are
+            // always packed into slots [0, activeCubeCount) - no reason to
+            // touch the other (1000 - activeCubeCount) empty slots at all.
+            IntegrateCubes(cubes, activeCubeCount, dt, currentGravity);
 
             /* 
              * ==========================================================================
@@ -787,9 +1340,9 @@ int main(int argc, char *argv[]) {
                 g_nodePoolCount = 0;
                 g_tokenCounter++;
                 if (g_tokenCounter == 0) g_tokenCounter = 1;
-                memset(g_pairCheckTokens, 0, sizeof(g_pairCheckTokens));
+                memset(g_pairCheckTokens, 0, (size_t)activeCubeCount * sizeof(g_pairCheckTokens[0]));
 
-                for (int i = 0; i < MAX_CUBES; i++) {
+                for (int i = 0; i < activeCubeCount; i++) {
                     if (!cubes[i].active) continue;
 
                     int minCellX = (int)((cubes[i].position.x - CUBE_SIZE * 0.6f) / CUBE_SIZE);
@@ -844,49 +1397,145 @@ int main(int argc, char *argv[]) {
             // Boundary Wall/Floor Pass
             for (int pass = 0; pass < SOLVER_ITERATIONS; pass++) {
                 bool isFirstPass = (pass == 0);
-                #pragma omp parallel for schedule(static, 64)
-                for (int k = 0; k < MAX_CUBES; k++) {
+                // "if" clause: only actually spins up worker threads once
+                // there's enough cubes to make it worth it (see
+                // OMP_PARALLEL_THRESHOLD) - otherwise this runs on the main
+                // thread like a normal loop, no thread wake/sync overhead.
+                #pragma omp parallel for schedule(static, 64) if(activeCubeCount > OMP_PARALLEL_THRESHOLD)
+                for (int k = 0; k < activeCubeCount; k++) {
                     if (!cubes[k].active) continue;
                     ResolveWallCollision(&cubes[k], minX, maxX, minY, maxY, invMass, invInertia, dt, isFirstPass);
                 }
             }
         }
 
+        double physicsMs = (GetTime() - physicsStepStart) * 1000.0;
+
+        UpdateParticles(frameDt);
+
         // --- HARDWARE GPU ACCELERATED BATCH RENDER ---
+        double drawStart = GetTime();
         BeginDrawing();
-            ClearBackground(BLACK);
+            
+            // BEGIN CAMERA MODE (World Space)
+            BeginMode2D(g_camera);
+            
+                DrawSceneBackground(screenWidth, screenHeight);
 
-            for (int k = 0; k < MAX_CUBES; k++) {
-                if (!cubes[k].active) continue;
+                // Hover Detection (Find which cube the mouse is over)
+                int hoveredCubeIdx = -1;
+                if (draggedCubeIdx == -1) { // Only check hover if we aren't currently dragging
+                    for (int k = activeCubeCount - 1; k >= 0; k--) {
+                        if (!cubes[k].active) continue;
+                        Vector2 corners[4];
+                        GetCubeCorners(cubes[k].position, CUBE_SIZE, cubes[k].rotation, corners);
+                        if (IsPointInCube(mousePos, corners)) {
+                            hoveredCubeIdx = k;
+                            break;
+                        }
+                    }
+                }
 
-                float speed = Vector2Length(cubes[k].velocity) + fabsf(cubes[k].angularVelocity * 30.0f);
-                float speedRatio = Clamp(speed / 1800.0f, 0.0f, 1.0f);
+                for (int k = 0; k < activeCubeCount; k++) {
+                    if (!cubes[k].active) continue;
 
-                Color base = cubes[k].baseColor;
-                Color renderColor = {
-                    (unsigned char)Clamp(base.r + (int)(55.0f * speedRatio), 0, 255),
-                    (unsigned char)Clamp(base.g + (int)(20.0f * speedRatio), 0, 255),
-                    (unsigned char)Clamp(base.b + (int)(40.0f * speedRatio), 0, 255),
-                    255
-                };
+                    float speed = Vector2Length(cubes[k].velocity) + fabsf(cubes[k].angularVelocity * 30.0f);
+                    float speedRatio = Clamp(speed / 1800.0f, 0.0f, 1.0f);
 
-                // GPU Hardware Vertex Batching via Raylib/OpenGL VBOs
-                DrawTexturePro(
-                    glowTexture,
-                    (Rectangle){ 0, 0, (float)glowTexSize, (float)glowTexSize },
-                    (Rectangle){ cubes[k].position.x, cubes[k].position.y, (float)glowTexSize, (float)glowTexSize },
-                    (Vector2){ (float)glowTexSize / 2.0f, (float)glowTexSize / 2.0f },
-                    cubes[k].rotation * RAD2DEG,
-                    base
-                );
+                    Color base = cubes[k].baseColor;
+                    Color renderColor = {
+                        (unsigned char)Clamp(base.r + (int)(55.0f * speedRatio), 0, 255),
+                        (unsigned char)Clamp(base.g + (int)(20.0f * speedRatio), 0, 255),
+                        (unsigned char)Clamp(base.b + (int)(40.0f * speedRatio), 0, 255),
+                        255
+                    };
 
-                DrawRectanglePro(
-                    (Rectangle){ cubes[k].position.x, cubes[k].position.y, CUBE_SIZE, CUBE_SIZE },
-                    (Vector2){ CUBE_SIZE / 2.0f, CUBE_SIZE / 2.0f },
-                    cubes[k].rotation * RAD2DEG,
-                    renderColor
-                );
-            }
+                    // Pop-in spawn animation: ease-out overshoot scale from 0 -> 1
+                    float spawnT = Clamp(cubes[k].spawnTimer / SPAWN_ANIM_DURATION, 0.0f, 1.0f);
+                    float easedT = 1.0f - powf(1.0f - spawnT, 3.0f);
+                    float overshoot = sinf(spawnT * PI) * 0.18f;
+                    float popScale = easedT + overshoot;
+                    float drawSize = CUBE_SIZE * popScale;
+                    float glowDrawSize = (float)glowTexSize * popScale;
+
+                    // GPU Hardware Vertex Batching via Raylib/OpenGL VBOs
+                    DrawTexturePro(
+                        glowTexture,
+                        (Rectangle){ 0, 0, (float)glowTexSize, (float)glowTexSize },
+                        (Rectangle){ cubes[k].position.x, cubes[k].position.y, glowDrawSize, glowDrawSize },
+                        (Vector2){ glowDrawSize / 2.0f, glowDrawSize / 2.0f },
+                        cubes[k].rotation * RAD2DEG,
+                        base
+                    );
+
+                    DrawRectanglePro(
+                        (Rectangle){ cubes[k].position.x, cubes[k].position.y, drawSize, drawSize },
+                        (Vector2){ drawSize / 2.0f, drawSize / 2.0f },
+                        cubes[k].rotation * RAD2DEG,
+                        renderColor
+                    );
+
+                    // Draw Hover Outline (Rotating black border)
+                    if (k == hoveredCubeIdx && !cubes[k].isDragged) {
+                        // Determine a larger size for the outline
+                        float outlineSize = drawSize + 3.0f;
+                        float halfOutline = outlineSize / 2.0f;
+                        
+                        // Calculate the 4 corners of the rotated outline rectangle
+                        float angle = cubes[k].rotation;
+                        float cosA = cosf(angle);
+                        float sinA = sinf(angle);
+                        Vector2 pos = cubes[k].position;
+                        
+                        // The four corners of the unrotated rectangle (centered on pos)
+                        Vector2 corners[4] = {
+                            { pos.x - halfOutline, pos.y - halfOutline },
+                            { pos.x + halfOutline, pos.y - halfOutline },
+                            { pos.x + halfOutline, pos.y + halfOutline },
+                            { pos.x - halfOutline, pos.y + halfOutline }
+                        };
+                        
+                        // Rotate them around `pos`
+                        Vector2 rotCorners[4];
+                        for(int i = 0; i < 4; i++) {
+                            // Translate to origin relative to pos
+                            Vector2 rel = { corners[i].x - pos.x, corners[i].y - pos.y };
+                            // Rotate
+                            Vector2 rot = { rel.x * cosA - rel.y * sinA, rel.x * sinA + rel.y * cosA };
+                            // Translate back
+                            rotCorners[i] = (Vector2){ pos.x + rot.x, pos.y + rot.y };
+                        }
+
+                        // Draw rotated lines using the mathematically rotated corners
+                        DrawLineEx(rotCorners[0], rotCorners[1], 4.0f, (Color){ 0, 0, 0, 220 });
+                        DrawLineEx(rotCorners[1], rotCorners[2], 4.0f, (Color){ 0, 0, 0, 220 }); 
+                        DrawLineEx(rotCorners[2], rotCorners[3], 4.0f, (Color){ 0, 0, 0, 220 });
+                        DrawLineEx(rotCorners[3], rotCorners[0], 4.0f, (Color){ 0, 0, 0, 220 });
+                    }
+                }
+
+                DrawParticles();
+
+                // --- DRAG WIRE AND HITBOX ---
+                if (draggedCubeIdx != -1 && cubes[draggedCubeIdx].active && cubes[draggedCubeIdx].isDragged) {
+                    RigidCube *c = &cubes[draggedCubeIdx];
+                    
+                    // Calculate the exact world position of the grab point on the cube
+                    Vector2 r = LocalToWorldVec(c->localGrabPt, c->rotation);
+                    Vector2 grabPtWorld = Vector2Add(c->position, r);
+
+                    // Draw the transparent gray wire from cube center to grab point
+                    DrawLineV(c->position, grabPtWorld, (Color){ 180, 180, 190, 100 }); 
+                    // Draw a slightly thicker wire from the grab point out to the mouse to show the spring tension
+                    DrawLineV(grabPtWorld, mousePos, (Color){ 200, 200, 210, 60 });
+
+                    // Draw the small hitbox circle at the cursor
+                    DrawCircleLinesV(mousePos, 6.0f, (Color){ 200, 200, 210, 150 });
+                    DrawCircleV(mousePos, 2.0f, (Color){ 255, 255, 255, 200 });
+                }
+
+            // END CAMERA MODE (Return to Screen Space for UI)
+            EndMode2D();
 
             int currentFps = GetFPS();
             int currentTps = (frameDt > 0.0f) ? (int)(PHYSICS_SUBSTEPS / frameDt) : 0;
@@ -904,6 +1553,55 @@ int main(int argc, char *argv[]) {
             DrawRectangle(hudX - 8, hudY - 4, textW + 16, fontSz + 8, (Color){ 0, 0, 0, 180 });
             DrawText(metricsBuffer, hudX, hudY, fontSz, (Color){ 0, 255, 128, 240 });
 
+            // --- F3 EXPANDED DEBUG OVERLAY ---
+            if (g_showDebugOverlay) {
+                int panelFontSz = 16;
+                int lineHeight = panelFontSz + 6;
+                int panelY = hudY + fontSz + 8 + 10; // sits just below the FPS/TPS badge
+
+                int activeParticles = CountActiveParticles();
+                float cpuPercent = GetProcessCPUPercent();
+
+                char lines[12][128];
+                int lineCount = 0;
+
+                snprintf(lines[lineCount++], sizeof(lines[0]), "Objects: %d / %d", activeCubeCount, MAX_CUBES);
+                snprintf(lines[lineCount++], sizeof(lines[0]), "Particles: %d / %d", activeParticles, MAX_PARTICLES);
+                snprintf(lines[lineCount++], sizeof(lines[0]), "Physics: %.2f ms  (%d sub x %d iter)", physicsMs, PHYSICS_SUBSTEPS, SOLVER_ITERATIONS);
+                snprintf(lines[lineCount++], sizeof(lines[0]), "Draw submit: %.2f ms", lastFrameDrawMs);
+                snprintf(lines[lineCount++], sizeof(lines[0]), "CPU: %.1f%%  (%d cores)", cpuPercent, GetLogicalCoreCount());
+                snprintf(lines[lineCount++], sizeof(lines[0]), "GPU: %s", GetGPURendererName());
+#ifdef _OPENMP
+                snprintf(lines[lineCount++], sizeof(lines[0]), "OpenMP threads: %d (active >%d objs)", omp_get_max_threads(), OMP_PARALLEL_THRESHOLD);
+#else
+                snprintf(lines[lineCount++], sizeof(lines[0]), "OpenMP: disabled at build time");
+#endif
+                snprintf(lines[lineCount++], sizeof(lines[0]), "Gravity: %s  |  Collisions: %s", (currentGravity > 0.0f) ? "ON" : "OFF", g_enableCubeCollisions ? "ON" : "OFF");
+#if defined(CUBE_SIMD_AVX2)
+                snprintf(lines[lineCount++], sizeof(lines[0]), "SIMD: AVX2 (8-wide)");
+#elif defined(CUBE_SIMD_SSE2)
+                snprintf(lines[lineCount++], sizeof(lines[0]), "SIMD: SSE2 (4-wide)");
+#else
+                snprintf(lines[lineCount++], sizeof(lines[0]), "SIMD: scalar fallback");
+#endif
+                snprintf(lines[lineCount++], sizeof(lines[0]), "Resolution: %dx%d", screenWidth, screenHeight);
+                snprintf(lines[lineCount++], sizeof(lines[0]), "Uptime: %.1f s  |  Frame #%lu", GetTime(), frameCounter);
+
+                int panelW = 0;
+                for (int i = 0; i < lineCount; i++) {
+                    int w = MeasureText(lines[i], panelFontSz);
+                    if (w > panelW) panelW = w;
+                }
+
+                int panelX = screenWidth - panelW - marginX;
+                int panelH = lineCount * lineHeight + 8;
+
+                DrawRectangle(panelX - 8, panelY - 4, panelW + 16, panelH, (Color){ 0, 0, 0, 180 });
+                for (int i = 0; i < lineCount; i++) {
+                    DrawText(lines[i], panelX, panelY + i * lineHeight, panelFontSz, (Color){ 220, 220, 230, 240 });
+                }
+            }
+
             if (quitHoldTimer > 0.0f) {
                 float alphaProgress = Clamp(quitHoldTimer / quitHoldRequired, 0.0f, 1.0f);
                 unsigned char textAlpha = (unsigned char)(alphaProgress * 255.0f);
@@ -917,6 +1615,8 @@ int main(int argc, char *argv[]) {
                 DrawRectangle(textX - 10, textY - 6, textWidth + 20, fontSize + 12, (Color){ 0, 0, 0, (unsigned char)(textAlpha * 0.75f) });
                 DrawText(quitText, textX, textY, fontSize, (Color){ 255, 255, 255, textAlpha });
             }
+
+        lastFrameDrawMs = (GetTime() - drawStart) * 1000.0;
 
         EndDrawing();
     }
