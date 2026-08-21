@@ -38,6 +38,15 @@ Fedora:
 sudo dnf install raylib-devel glfw-devel vulkan-tools libgomp
 ```
 
+NixOS:
+```bash
+# initialize nix shell
+nix-shell
+# then compile
+gcc -fopenmp -O3 cube.c -o cube -lraylib -lglfw -lvulkan -lm -lpthread -ldl -march=native
+# if you want cmake, then add it yourself into shell.nix, but ill add it myself soon.
+```
+
 ### Using CMake
 
 ```bash
@@ -63,3 +72,4 @@ This is GNU
 - It's not optimized, so with OpenMP your CPU will probably go 90%
 - X11 is **not** supported, but soon will be supported.
 - I don't really know what to put here.
+- It is a bit buggy on NixOS
