@@ -979,9 +979,9 @@ int main(int argc, char *argv[]) {
             PrintHelp();
             return 0;
         } else if (strcmp(argv[i], "--version") == 0 || strcmp(argv[i], "-v") == 0) {
-            printf("######   cube.c, version %s\n", APP_VERSION);
-            printf("######   Copyright (c) NotTWM <270893670+totallynotaworldmachine479-source@users.noreply.github.com>\n");
-            printf("######   Licensed under the MIT License (See LICENSE or https://opensource.org/license/mit)\n");
+            printf("████████   cube.c, version %s\n", APP_VERSION);
+            printf("████████   Copyright (c) NotTWM <270893670+nottwm@users.noreply.github.com>\n");
+            printf("████████   Licensed under the MIT License (See LICENSE or https://opensource.org/license/mit)\n");
             return 0;
         } else if (strcmp(argv[i], "--debug") == 0 || strcmp(argv[i], "-d") == 0) {
             g_debugMode = true;
